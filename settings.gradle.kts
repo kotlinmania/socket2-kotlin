@@ -17,4 +17,3 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "socket2-kotlin"
-
