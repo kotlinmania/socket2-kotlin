@@ -4,6 +4,7 @@ import org.gradle.api.tasks.testing.AbstractTestTask
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.gradle.kotlin.dsl.support.serviceOf
+import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.language.cpp.tasks.CppCompile
 import org.gradle.nativeplatform.Linkage
 import org.gradle.nativeplatform.tasks.CreateStaticLibrary
@@ -22,7 +23,12 @@ import org.jetbrains.kotlin.gradle.targets.wasm.nodejs.WasmNodeJsEnvSpec
 import org.jetbrains.kotlin.gradle.targets.wasm.yarn.WasmYarnRootEnvSpec
 import java.io.ByteArrayInputStream
 import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
 import java.nio.file.Files
+import java.util.Base64
+import java.util.UUID
 import java.nio.file.StandardCopyOption
 import java.util.zip.ZipInputStream
 
@@ -36,6 +42,12 @@ plugins {
     alias(libs.plugins.kotlinx.benchmark)
     alias(libs.plugins.kotlin.allopen)
     `cpp-library`
+    // First-party publishing. Deliberately NOT the vanniktech convenience
+    // plugin: it rejects cpp-library's native publication at configuration
+    // time (forMultiplatform can't classify it). maven-publish is permissive,
+    // so it coexists with cpp-library; Central Portal upload is a bespoke task.
+    `maven-publish`
+    signing
 }
 
 group = providers.gradleProperty("project.group").getOrElse("io.github.kotlinmania")
@@ -385,12 +397,15 @@ library {
 }
 
 tasks.withType<CppCompile>().configureEach {
-    compilerArgs.addAll(listOf("-std=c++17", "-fPIC"))
+    compilerArgs.addAll("-std=c++17", "-fPIC")
 
-    // Platform-specific compiler args
-    if (targetPlatform.get().operatingSystem.isMacOsX) {
-        compilerArgs.add("-stdlib=libc++")
-    }
+    // Platform-specific args, resolved lazily — the plugin sets targetPlatform
+    // after this configureEach runs, so querying it eagerly fails.
+    compilerArgs.addAll(
+        targetPlatform.map { platform ->
+            if (platform.operatingSystem.isMacOsX) listOf("-stdlib=libc++") else emptyList()
+        },
+    )
 }
 
 // Ensure the static library is built before any cinterop task runs.
@@ -795,42 +810,151 @@ tasks.matching { task ->
 }
 
 // ============================================================================
-// Maven Central publishing
+// Maven Central publishing — Central Portal, first-party + bespoke upload
+// ----------------------------------------------------------------------------
+// OSSRH was sunset 2025-06-30; the Central Portal is the only path. Sonatype
+// ships no first-party Gradle plugin, so we use Gradle's own maven-publish +
+// signing (KGP populates the KMP publications) and upload the deployment
+// bundle to the Portal API ourselves. No convenience plugin = no clash with
+// cpp-library's native publication.
+//
+// Flow: publish all KMP publications into a local staging Maven layout ->
+// zip it -> POST the zip to the Portal upload endpoint with a Bearer token.
 // ============================================================================
-mavenPublishing {
-    publishToMavenCentral()
-    if (project.findProperty("RELEASE_SIGNING_ENABLED") != "false") {
-        signAllPublications()
+val publishProjectName = providers.gradleProperty("project.name").getOrElse("unnamed-project")
+
+// Central requires a Javadoc jar per publication; KMP produces none, so attach
+// an empty one to every Maven publication.
+val emptyJavadocJar by tasks.registering(Jar::class) {
+    archiveClassifier.set("javadoc")
+}
+
+// The cpp-library plugin registers a native publication named "main" (artifactId
+// socket2_wrapper). It is internal tooling consumed by cinterop — never shipped
+// to Maven Central — so it is excluded from POM config, staging, and the bundle.
+val cppLibraryPublicationName = "main"
+
+publishing {
+    publications.withType<MavenPublication>().matching { it.name != cppLibraryPublicationName }.configureEach {
+        artifact(emptyJavadocJar)
+        pom {
+            name.set(publishProjectName)
+            description.set(providers.gradleProperty("project.pom.description").getOrElse(""))
+            inceptionYear.set("2026")
+            url.set("https://github.com/KotlinMania/$publishProjectName")
+            licenses {
+                license {
+                    name.set(providers.gradleProperty("project.pom.licenseName").getOrElse("MIT"))
+                    url.set(
+                        providers.gradleProperty("project.pom.licenseUrl")
+                            .getOrElse("https://opensource.org/licenses/MIT"),
+                    )
+                    distribution.set("repo")
+                }
+            }
+            developers {
+                developer {
+                    id.set("sydneyrenee")
+                    name.set("Sydney Renee")
+                    email.set("sydney@solace.ofharmony.ai")
+                    url.set("https://github.com/sydneyrenee")
+                }
+            }
+            scm {
+                url.set("https://github.com/KotlinMania/$publishProjectName")
+                connection.set("scm:git:git://github.com/KotlinMania/$publishProjectName.git")
+                developerConnection.set("scm:git:ssh://github.com/KotlinMania/$publishProjectName.git")
+            }
+        }
     }
-    val projectName = providers.gradleProperty("project.name").getOrElse("unnamed-project")
-    coordinates(group.toString(), projectName, version.toString())
-    pom {
-        name.set(projectName)
-        description.set(providers.gradleProperty("project.pom.description").getOrElse(""))
-        inceptionYear.set("2026")
-        url.set("https://github.com/KotlinMania/$projectName")
-        licenses {
-            license {
-                name.set(providers.gradleProperty("project.pom.licenseName").getOrElse("MIT"))
-                url.set(
-                    providers.gradleProperty("project.pom.licenseUrl").getOrElse("https://opensource.org/licenses/MIT"),
-                )
-                distribution.set("repo")
-            }
+
+    // Stage into a local Maven layout that becomes the Portal deployment bundle.
+    // maven-publish auto-generates the md5/sha1/sha256/sha512 checksums Central
+    // requires; signing (below) adds the .asc signatures.
+    repositories {
+        maven {
+            name = "centralPortalStaging"
+            url = uri(layout.buildDirectory.dir("staging-deploy"))
         }
-        developers {
-            developer {
-                id.set("sydneyrenee")
-                name.set("Sydney Renee")
-                email.set("sydney@solace.ofharmony.ai")
-                url.set("https://github.com/sydneyrenee")
-            }
+    }
+}
+
+signing {
+    val signingKey = providers.gradleProperty("signingInMemoryKey").orNull
+    val signingKeyId = providers.gradleProperty("signingInMemoryKeyId").orNull
+    val signingPassword = providers.gradleProperty("signingInMemoryKeyPassword").orNull
+    val signingEnabled = project.findProperty("RELEASE_SIGNING_ENABLED") != "false" && signingKey != null
+    if (signingEnabled) {
+        useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
+        sign(publishing.publications.matching { it.name != cppLibraryPublicationName })
+    }
+}
+
+// Never stage/publish the C++ wrapper publication to Maven Central.
+tasks.matching {
+    it.name.startsWith("publish") && it.name.contains("MainPublication")
+}.configureEach { enabled = false }
+
+// Zip the staged Maven layout into a single Central Portal deployment bundle.
+val centralPortalBundle by tasks.registering(Zip::class) {
+    group = "publishing"
+    description = "Bundles the staged Maven artifacts into a Central Portal deployment zip."
+    dependsOn("publishAllPublicationsToCentralPortalStagingRepository")
+    from(layout.buildDirectory.dir("staging-deploy"))
+    archiveFileName.set("$publishProjectName-$version-bundle.zip")
+    destinationDirectory.set(layout.buildDirectory.dir("central-portal"))
+}
+
+// Upload the bundle to the Sonatype Central Portal Publisher API.
+// publishingType: USER_MANAGED (default, safe — validates then waits for a
+// manual release in the Portal UI) or AUTOMATIC (publishes after validation).
+val publishToCentralPortal by tasks.registering {
+    group = "publishing"
+    description = "Uploads the deployment bundle to the Sonatype Central Portal."
+    dependsOn(centralPortalBundle)
+    doLast {
+        val user = providers.gradleProperty("mavenCentralUsername").orNull
+            ?: error("mavenCentralUsername is required to publish to the Central Portal.")
+        val password = providers.gradleProperty("mavenCentralPassword").orNull
+            ?: error("mavenCentralPassword is required to publish to the Central Portal.")
+        val publishingType = providers.gradleProperty("centralPublishingType").getOrElse("USER_MANAGED")
+        val token = Base64.getEncoder().encodeToString("$user:$password".toByteArray(Charsets.UTF_8))
+
+        val bundle = centralPortalBundle.get().archiveFile.get().asFile
+        require(bundle.exists()) { "Deployment bundle not found: $bundle" }
+
+        // Build the multipart/form-data body by hand (single 'bundle' part).
+        val boundary = "CentralPortalBoundary" + UUID.randomUUID().toString().replace("-", "")
+        val crlf = "\r\n"
+        val preamble = (
+            "--$boundary$crlf" +
+                "Content-Disposition: form-data; name=\"bundle\"; filename=\"${bundle.name}\"$crlf" +
+                "Content-Type: application/octet-stream$crlf$crlf"
+        ).toByteArray(Charsets.UTF_8)
+        val epilogue = "$crlf--$boundary--$crlf".toByteArray(Charsets.UTF_8)
+        val body = preamble + bundle.readBytes() + epilogue
+
+        val deploymentName = "$publishProjectName-$version"
+        val uploadUri = URI(
+            "https://central.sonatype.com/api/v1/publisher/upload" +
+                "?name=$deploymentName&publishingType=$publishingType",
+        )
+        val request = HttpRequest.newBuilder()
+            .uri(uploadUri)
+            .header("Authorization", "Bearer $token")
+            .header("Content-Type", "multipart/form-data; boundary=$boundary")
+            .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+            .build()
+
+        val client = HttpClient.newHttpClient()
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+        if (response.statusCode() !in 200..299) {
+            error("Central Portal upload failed: HTTP ${response.statusCode()} — ${response.body()}")
         }
-        scm {
-            url.set("https://github.com/KotlinMania/$projectName")
-            connection.set("scm:git:git://github.com/KotlinMania/$projectName.git")
-            developerConnection.set("scm:git:ssh://github.com/KotlinMania/$projectName.git")
-        }
+        logger.lifecycle(
+            "Central Portal upload accepted (deployment id: ${response.body()}). " +
+                "publishingType=$publishingType.",
+        )
     }
 }
 
