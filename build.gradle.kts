@@ -367,8 +367,21 @@ library {
     // Static linkage so cinterop can bundle the archive directly.
     linkage.set(listOf(Linkage.STATIC))
 
-    // Target current host platform only (CI builds on native runners)
-    targetMachines.set(listOf(machines.host))
+    // Declare every host-native machine our CI runners cover. Gradle's
+    // cpp-library plugin CANNOT cross-compile — it only builds the variant
+    // matching the build host and creates no tasks for the others. So the
+    // macOS runner builds macОS, the Linux runner builds Linux, the Windows
+    // runner builds Windows; each is a host-native compile, never a cross.
+    // (Ref: Gradle cpp_library_plugin docs — cross-compilation unsupported.)
+    targetMachines.set(
+        listOf(
+            machines.macOS.architecture("aarch64"),
+            machines.macOS.x86_64,
+            machines.linux.x86_64,
+            machines.linux.architecture("aarch64"),
+            machines.windows.x86_64,
+        ),
+    )
 }
 
 tasks.withType<CppCompile>().configureEach {
