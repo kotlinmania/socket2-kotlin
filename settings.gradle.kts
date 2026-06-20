@@ -15,4 +15,7 @@ dependencyResolutionManagement {
     }
 }
 
+// Include libc-kotlin from sibling directory for local development
+includeBuild("../libc-kotlin")
+
 rootProject.name = "socket2-kotlin"

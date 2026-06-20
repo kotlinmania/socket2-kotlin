@@ -4,6 +4,9 @@ import org.gradle.api.tasks.testing.AbstractTestTask
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.gradle.kotlin.dsl.support.serviceOf
+import org.gradle.language.cpp.tasks.CppCompile
+import org.gradle.nativeplatform.Linkage
+import org.gradle.nativeplatform.tasks.CreateStaticLibrary
 import org.gradle.process.ExecOperations
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -32,6 +35,7 @@ plugins {
     alias(libs.plugins.ktlint)
     alias(libs.plugins.kotlinx.benchmark)
     alias(libs.plugins.kotlin.allopen)
+    `cpp-library`
 }
 
 group = providers.gradleProperty("project.group").getOrElse("io.github.kotlinmania")
@@ -341,8 +345,59 @@ val jvmToolchainVersion = providers.gradleProperty("jvm.toolchain").getOrElse("2
 //   target surface, so there are NO opt-in build gates. The build gate is the
 //   contract that forces every current KotlinMania target to compile.
 // ============================================================================
+
+// ============================================================================
+// C++ Wrapper Compilation for Native Interop
+// ----------------------------------------------------------------------------
+// Gradle's cpp-library plugin compiles the socket2 C++ wrapper as a static
+// library, which cinterop then bundles into the produced klib. Source lives in
+// src/nativeInterop/cinterop (not the plugin default src/main/cpp), so the
+// source/header dirs are set explicitly. STATIC linkage gives cinterop a
+// libsocket2_wrapper.a to bundle (no runtime .dylib dependency).
+// ============================================================================
+library {
+    baseName.set("socket2_wrapper")
+
+    // Source files
+    source.from(file("src/nativeInterop/cinterop/socket2_wrapper.cpp"))
+
+    // Private headers
+    privateHeaders.from(file("src/nativeInterop/cinterop"))
+
+    // Static linkage so cinterop can bundle the archive directly.
+    linkage.set(listOf(Linkage.STATIC))
+
+    // Target current host platform only (CI builds on native runners)
+    targetMachines.set(listOf(machines.host))
+}
+
+tasks.withType<CppCompile>().configureEach {
+    compilerArgs.addAll(listOf("-std=c++17", "-fPIC"))
+
+    // Platform-specific compiler args
+    if (targetPlatform.get().operatingSystem.isMacOsX) {
+        compilerArgs.add("-stdlib=libc++")
+    }
+}
+
+// Ensure the static library is built before any cinterop task runs.
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.CInteropProcess>().configureEach {
+    dependsOn(tasks.withType<CreateStaticLibrary>())
+}
+
+// ============================================================================
 kotlin {
     jvmToolchain(jvmToolchainVersion)
+
+    // Configure cinterop for all native targets
+    targets.withType<KotlinNativeTarget>().configureEach {
+        compilations.getByName("main") {
+            cinterops.create("socket2") {
+                defFile = project.file("src/nativeInterop/cinterop/socket2.def")
+                includeDirs(project.file("src/nativeInterop/cinterop"))
+            }
+        }
+    }
 
     applyDefaultHierarchyTemplate()
 
@@ -658,6 +713,72 @@ rootProject.extensions.configure<NodeJsRootExtension>("kotlinNodeJs") {
     versions.karmaWebpack.version = "file:$patchedKarmaWebpackPackage"
     versions.mocha.version = providers.gradleProperty("node.mocha.version").getOrElse("12.0.0-beta-10")
     versions.kotlinWebHelpers.version = providers.gradleProperty("node.kotlinWebHelpers.version").getOrElse("3.1.0")
+}
+
+// ============================================================================
+// N-API Native Bindings Build
+// ----------------------------------------------------------------------------
+// Build the socket2-kotlin N-API module that provides direct POSIX syscalls
+// to Node.js. This must complete before Kotlin/JS compilation so the external
+// declarations can reference the compiled addon.
+// ============================================================================
+
+val napiModuleDir = layout.projectDirectory.dir("native/node-socket").asFile
+val napiModuleBuildMarker = napiModuleDir.resolve("build/Release/socket2_native.node")
+
+val buildNativeBindings by tasks.registering(Exec::class) {
+    group = "build"
+    description = "Builds the N-API native bindings for Node.js using node-gyp"
+
+    workingDir = napiModuleDir
+
+    // Install dependencies first, then build
+    commandLine("npm", "install")
+
+    inputs.files(
+        napiModuleDir.resolve("binding.gyp"),
+        napiModuleDir.resolve("package.json"),
+        napiModuleDir.resolve("src/socket_bindings.cpp")
+    )
+    outputs.file(napiModuleBuildMarker)
+
+    doFirst {
+        if (!napiModuleDir.exists()) {
+            throw GradleException(
+                "N-API module directory not found: $napiModuleDir\n" +
+                "The native bindings are required for Node.js support."
+            )
+        }
+    }
+
+    doLast {
+        if (!napiModuleBuildMarker.exists()) {
+            throw GradleException(
+                "N-API build failed: ${napiModuleBuildMarker.absolutePath} not found.\n" +
+                "Check that node-gyp and required build tools are installed."
+            )
+        }
+        logger.lifecycle("✓ N-API native bindings built: ${napiModuleBuildMarker.absolutePath}")
+    }
+}
+
+val cleanNativeBindings by tasks.registering(Delete::class) {
+    group = "build"
+    description = "Cleans the N-API native bindings build artifacts"
+    delete(napiModuleDir.resolve("build"))
+    delete(napiModuleDir.resolve("node_modules"))
+}
+
+tasks.named("clean") {
+    dependsOn(cleanNativeBindings)
+}
+
+// Make all Node.js Kotlin compilation tasks depend on the N-API build
+tasks.matching { task ->
+    task.name.matches(Regex("compileKotlin(Js|Node|WasmJs).*")) ||
+    task.name.matches(Regex(".*(js|node|wasmJs)MainClasses"))
+}.configureEach {
+    dependsOn(buildNativeBindings)
 }
 
 // ============================================================================

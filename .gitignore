@@ -66,3 +66,6 @@ DerivedData/
 *.xcuserstate
 *.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
+
+# Obsolete manual C++ object (cpp-library produces the .a now)
+src/nativeInterop/cinterop/*.o

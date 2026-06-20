@@ -29,9 +29,9 @@ public data class Domain(public val value: Int) {
         /**
          * Returns the correct domain for [address].
          */
-        public fun forAddress(address: SocketAddress): Domain = when (address) {
-            is SocketAddress.V4 -> IPV4
-            is SocketAddress.V6 -> IPV6
+        public fun forAddress(address: Socket2SocketAddress): Domain = when (address) {
+            is Socket2SocketAddress.V4 -> IPV4
+            is Socket2SocketAddress.V6 -> IPV6
         }
     }
 }
@@ -43,12 +43,3 @@ public data class Domain(public val value: Int) {
 internal expect val AF_INET: Int
 internal expect val AF_INET6: Int
 internal expect val AF_UNIX: Int
-
-/**
- * Sealed class representing socket addresses.
- * Simplified version of std::net::SocketAddr for initial port.
- */
-public sealed class SocketAddress {
-    public data class V4(val address: String, val port: Int) : SocketAddress()
-    public data class V6(val address: String, val port: Int) : SocketAddress()
-}
