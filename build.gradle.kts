@@ -1,13 +1,15 @@
 import org.gradle.api.GradleException
 import org.gradle.api.artifacts.VersionCatalogsExtension
+import org.gradle.api.publish.maven.MavenPublication
+import org.gradle.api.publish.maven.tasks.PublishToMavenRepository
 import org.gradle.api.tasks.testing.AbstractTestTask
 import org.gradle.api.tasks.testing.logging.TestExceptionFormat
 import org.gradle.api.tasks.testing.logging.TestLogEvent
 import org.gradle.kotlin.dsl.support.serviceOf
-import org.gradle.api.publish.maven.MavenPublication
 import org.gradle.language.cpp.tasks.CppCompile
 import org.gradle.nativeplatform.Linkage
 import org.gradle.nativeplatform.tasks.CreateStaticLibrary
+import org.gradle.plugins.signing.Sign
 import org.gradle.process.ExecOperations
 import org.jetbrains.kotlin.gradle.ExperimentalWasmDsl
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
@@ -41,10 +43,9 @@ plugins {
     alias(libs.plugins.kotlinx.benchmark)
     alias(libs.plugins.kotlin.allopen)
     `cpp-library`
-    // First-party publishing. Deliberately NOT the vanniktech convenience
-    // plugin: it rejects cpp-library's native publication at configuration
-    // time (forMultiplatform can't classify it). maven-publish is permissive,
-    // so it coexists with cpp-library; Central Portal upload is a bespoke task.
+    // First-party publishing. The convenience publishing plugin rejects
+    // cpp-library's native publication at configuration time. maven-publish
+    // coexists with cpp-library; Central Portal upload is a bespoke task.
     `maven-publish`
     signing
 }
@@ -833,7 +834,7 @@ val emptyJavadocJar by tasks.registering(Jar::class) {
 val cppLibraryPublicationName = "main"
 
 publishing {
-    publications.withType<MavenPublication>().matching { it.name != cppLibraryPublicationName }.configureEach {
+    publications.withType<MavenPublication>().matching { !it.name.startsWith(cppLibraryPublicationName) }.configureEach {
         artifact(emptyJavadocJar)
         pom {
             name.set(publishProjectName)
@@ -884,20 +885,29 @@ signing {
     val signingEnabled = project.findProperty("RELEASE_SIGNING_ENABLED") != "false" && signingKey != null
     if (signingEnabled) {
         useInMemoryPgpKeys(signingKeyId, signingKey, signingPassword)
-        sign(publishing.publications.matching { it.name != cppLibraryPublicationName })
+        sign(publishing.publications.matching { !it.name.startsWith(cppLibraryPublicationName) })
     }
+}
+
+val centralPortalPublishTasks =
+    tasks.withType<PublishToMavenRepository>().matching {
+        it.name.endsWith("ToCentralPortalStagingRepository") && !it.name.startsWith("publishMain")
+    }
+
+centralPortalPublishTasks.configureEach {
+    dependsOn(tasks.withType<Sign>())
 }
 
 // Never stage/publish the C++ wrapper publication to Maven Central.
 tasks.matching {
-    it.name.startsWith("publish") && it.name.contains("MainPublication")
+    it.name.startsWith("publishMain") && it.name.contains("Publication")
 }.configureEach { enabled = false }
 
 // Zip the staged Maven layout into a single Central Portal deployment bundle.
 val centralPortalBundle by tasks.registering(Zip::class) {
     group = "publishing"
     description = "Bundles the staged Maven artifacts into a Central Portal deployment zip."
-    dependsOn("publishAllPublicationsToCentralPortalStagingRepository")
+    dependsOn(centralPortalPublishTasks)
     from(layout.buildDirectory.dir("staging-deploy"))
     archiveFileName.set("$publishProjectName-$version-bundle.zip")
     destinationDirectory.set(layout.buildDirectory.dir("central-portal"))
