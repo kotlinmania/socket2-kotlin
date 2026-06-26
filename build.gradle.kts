@@ -1,3 +1,4 @@
+import groovy.json.JsonSlurper
 import org.gradle.api.GradleException
 import org.gradle.api.artifacts.VersionCatalogsExtension
 import org.gradle.api.publish.maven.MavenPublication
@@ -29,9 +30,9 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.util.Base64
 import java.util.UUID
-import java.nio.file.StandardCopyOption
 import java.util.zip.ZipInputStream
 
 plugins {
@@ -765,7 +766,7 @@ val buildNativeBindings by tasks.registering(Exec::class) {
     inputs.files(
         napiModuleDir.resolve("binding.gyp"),
         napiModuleDir.resolve("package.json"),
-        napiModuleDir.resolve("src/socket_bindings.cpp")
+        napiModuleDir.resolve("src/socket_bindings.cpp"),
     )
     outputs.file(napiModuleBuildMarker)
 
@@ -773,7 +774,7 @@ val buildNativeBindings by tasks.registering(Exec::class) {
         if (!napiModuleDir.exists()) {
             throw GradleException(
                 "N-API module directory not found: $napiModuleDir\n" +
-                "The native bindings are required for Node.js support."
+                    "The native bindings are required for Node.js support.",
             )
         }
     }
@@ -782,7 +783,7 @@ val buildNativeBindings by tasks.registering(Exec::class) {
         if (!napiModuleBuildMarker.exists()) {
             throw GradleException(
                 "N-API build failed: ${napiModuleBuildMarker.absolutePath} not found.\n" +
-                "Check that node-gyp and required build tools are installed."
+                    "Check that node-gyp and required build tools are installed.",
             )
         }
         logger.lifecycle("✓ N-API native bindings built: ${napiModuleBuildMarker.absolutePath}")
@@ -801,12 +802,13 @@ tasks.named("clean") {
 }
 
 // Make all Node.js Kotlin compilation tasks depend on the N-API build
-tasks.matching { task ->
-    task.name.matches(Regex("compileKotlin(Js|Node|WasmJs).*")) ||
-    task.name.matches(Regex(".*(js|node|wasmJs)MainClasses"))
-}.configureEach {
-    dependsOn(buildNativeBindings)
-}
+tasks
+    .matching { task ->
+        task.name.matches(Regex("compileKotlin(Js|Node|WasmJs).*")) ||
+            task.name.matches(Regex(".*(js|node|wasmJs)MainClasses"))
+    }.configureEach {
+        dependsOn(buildNativeBindings)
+    }
 
 // ============================================================================
 // Maven Central publishing — Central Portal, first-party + bespoke upload
@@ -845,7 +847,8 @@ publishing {
                 license {
                     name.set(providers.gradleProperty("project.pom.licenseName").getOrElse("MIT"))
                     url.set(
-                        providers.gradleProperty("project.pom.licenseUrl")
+                        providers
+                            .gradleProperty("project.pom.licenseUrl")
                             .getOrElse("https://opensource.org/licenses/MIT"),
                     )
                     distribution.set("repo")
@@ -899,9 +902,10 @@ centralPortalPublishTasks.configureEach {
 }
 
 // Never stage/publish the C++ wrapper publication to Maven Central.
-tasks.matching {
-    it.name.startsWith("publishMain") && it.name.contains("Publication")
-}.configureEach { enabled = false }
+tasks
+    .matching {
+        it.name.startsWith("publishMain") && it.name.contains("Publication")
+    }.configureEach { enabled = false }
 
 // Zip the staged Maven layout into a single Central Portal deployment bundle.
 val centralPortalBundle by tasks.registering(Zip::class) {
@@ -921,47 +925,105 @@ val publishToCentralPortal by tasks.registering {
     description = "Uploads the deployment bundle to the Sonatype Central Portal."
     dependsOn(centralPortalBundle)
     doLast {
-        val user = providers.gradleProperty("mavenCentralUsername").orNull
-            ?: error("mavenCentralUsername is required to publish to the Central Portal.")
-        val password = providers.gradleProperty("mavenCentralPassword").orNull
-            ?: error("mavenCentralPassword is required to publish to the Central Portal.")
+        val user =
+            providers.gradleProperty("mavenCentralUsername").orNull
+                ?: error("mavenCentralUsername is required to publish to the Central Portal.")
+        val password =
+            providers.gradleProperty("mavenCentralPassword").orNull
+                ?: error("mavenCentralPassword is required to publish to the Central Portal.")
         val publishingType = providers.gradleProperty("centralPublishingType").getOrElse("USER_MANAGED")
         val token = Base64.getEncoder().encodeToString("$user:$password".toByteArray(Charsets.UTF_8))
 
-        val bundle = centralPortalBundle.get().archiveFile.get().asFile
+        val bundle =
+            centralPortalBundle
+                .get()
+                .archiveFile
+                .get()
+                .asFile
         require(bundle.exists()) { "Deployment bundle not found: $bundle" }
 
-        // Build the multipart/form-data body by hand (single 'bundle' part).
         val boundary = "CentralPortalBoundary" + UUID.randomUUID().toString().replace("-", "")
         val crlf = "\r\n"
-        val preamble = (
-            "--$boundary$crlf" +
-                "Content-Disposition: form-data; name=\"bundle\"; filename=\"${bundle.name}\"$crlf" +
-                "Content-Type: application/octet-stream$crlf$crlf"
-        ).toByteArray(Charsets.UTF_8)
+        val preamble =
+            (
+                "--$boundary$crlf" +
+                    "Content-Disposition: form-data; name=\"bundle\"; filename=\"${bundle.name}\"$crlf" +
+                    "Content-Type: application/octet-stream$crlf$crlf"
+            ).toByteArray(Charsets.UTF_8)
         val epilogue = "$crlf--$boundary--$crlf".toByteArray(Charsets.UTF_8)
         val body = preamble + bundle.readBytes() + epilogue
 
         val deploymentName = "$publishProjectName-$version"
-        val uploadUri = URI(
-            "https://central.sonatype.com/api/v1/publisher/upload" +
-                "?name=$deploymentName&publishingType=$publishingType",
-        )
-        val request = HttpRequest.newBuilder()
-            .uri(uploadUri)
-            .header("Authorization", "Bearer $token")
-            .header("Content-Type", "multipart/form-data; boundary=$boundary")
-            .POST(HttpRequest.BodyPublishers.ofByteArray(body))
-            .build()
+        val uploadUri =
+            URI(
+                "https://central.sonatype.com/api/v1/publisher/upload" +
+                    "?name=$deploymentName&publishingType=$publishingType",
+            )
+        val request =
+            HttpRequest
+                .newBuilder()
+                .uri(uploadUri)
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "multipart/form-data; boundary=$boundary")
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .build()
 
         val client = HttpClient.newHttpClient()
         val response = client.send(request, HttpResponse.BodyHandlers.ofString())
         if (response.statusCode() !in 200..299) {
             error("Central Portal upload failed: HTTP ${response.statusCode()} — ${response.body()}")
         }
+        val deploymentId = response.body().trim()
         logger.lifecycle(
-            "Central Portal upload accepted (deployment id: ${response.body()}). " +
+            "Central Portal upload accepted (deployment id: $deploymentId). " +
                 "publishingType=$publishingType.",
+        )
+        val automaticPublishing = publishingType.equals("AUTOMATIC", ignoreCase = true)
+        val terminalStates =
+            if (automaticPublishing) {
+                setOf("PUBLISHED")
+            } else {
+                setOf("VALIDATED", "PUBLISHED")
+            }
+        val statusUri = URI("https://central.sonatype.com/api/v1/publisher/status?id=$deploymentId")
+        val statusAttempts =
+            providers.gradleProperty("centralPublishStatusAttempts").map(String::toInt).getOrElse(120)
+        val statusDelayMillis =
+            providers.gradleProperty("centralPublishStatusDelayMillis").map(String::toLong).getOrElse(10_000L)
+        repeat(statusAttempts) { attempt ->
+            val statusRequest =
+                HttpRequest
+                    .newBuilder()
+                    .uri(statusUri)
+                    .header("Authorization", "Bearer $token")
+                    .POST(HttpRequest.BodyPublishers.noBody())
+                    .build()
+            val statusResponse = client.send(statusRequest, HttpResponse.BodyHandlers.ofString())
+            if (statusResponse.statusCode() !in 200..299) {
+                error("Central Portal status check failed: HTTP ${statusResponse.statusCode()} — ${statusResponse.body()}")
+            }
+            val statusBody = JsonSlurper().parseText(statusResponse.body()) as Map<*, *>
+            val deploymentState =
+                statusBody["deploymentState"]?.toString()
+                    ?: error("Central Portal status response did not contain deploymentState: ${statusResponse.body()}")
+            when (deploymentState) {
+                "FAILED" -> error("Central Portal deployment failed: ${statusBody["errors"] ?: statusResponse.body()}")
+                in terminalStates -> {
+                    logger.lifecycle("Central Portal deployment $deploymentId reached $deploymentState.")
+                    return@doLast
+                }
+            }
+            logger.lifecycle(
+                "Central Portal deployment $deploymentId is $deploymentState " +
+                    "(${attempt + 1}/$statusAttempts).",
+            )
+            if (attempt + 1 < statusAttempts) {
+                Thread.sleep(statusDelayMillis)
+            }
+        }
+        error(
+            "Central Portal deployment $deploymentId did not reach " +
+                "${terminalStates.joinToString("/")} after $statusAttempts checks.",
         )
     }
 }
